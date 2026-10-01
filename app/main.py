@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from .isolation import (
     IsolationRuleError,
@@ -144,7 +145,20 @@ async def plan_resupply_endpoint(request: Request) -> JSONResponse:
 
 # --------------------------------------------------------------------------- #
 # 停管隔离作业（仅存于单进程内存，重启即清空；无对应页面）
+#
+# 创建与切换包含耗时的稳态求解。这些同步计算通过 run_in_threadpool 在工作
+# 线程中执行（隔离层自身只在取状态与提交时短暂持有作业锁），因此某个作业
+# 计算期间：/api/health 立即响应；已存在作业的读取只取一次短锁、立即返回
+# 最近提交的完整快照；其他作业（及同作业其他版本）的合法切换照常被处理。
 # --------------------------------------------------------------------------- #
+_T = TypeVar("_T")
+
+
+async def _run_isolation(func: Callable[..., _T], *args: Any) -> _T:
+    """在线程池中执行隔离作业的同步（含耗时求解）函数。"""
+    return await run_in_threadpool(func, *args)
+
+
 _ISOLATION_ERRORS = (
     ValidationError,
     IsolationRuleError,
@@ -175,7 +189,7 @@ async def create_isolation_job(request: Request) -> JSONResponse:
     if bad is not None:
         return bad
     try:
-        snapshot = create_job(payload)
+        snapshot = await _run_isolation(create_job, payload)
     except _ISOLATION_ERRORS as exc:
         return _isolation_error(exc)
     return JSONResponse(content={"ok": True, "job": snapshot})
@@ -199,7 +213,7 @@ async def toggle_isolation_pipe(job_id: str, request: Request) -> JSONResponse:
     if bad is not None:
         return bad
     try:
-        snapshot = toggle_pipe(job_id, payload)
+        snapshot = await _run_isolation(toggle_pipe, job_id, payload)
     except _ISOLATION_ERRORS as exc:
         return _isolation_error(exc)
     pipe_id = payload["pipe_id"].strip()

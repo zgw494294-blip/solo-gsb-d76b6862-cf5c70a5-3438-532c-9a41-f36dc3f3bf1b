@@ -2,12 +2,16 @@
 
 覆盖：创建（含初始欠压/不收敛不创建）、allow_unserved 校验、切换管段的
 失供/欠压/不收敛规则、仅剩水源供水量为零、重连恢复原需水量、版本冲突
-（含多线程并发同一版本最多成功一次）、读取快照一致性、404/400/422 分支。
+（含多线程并发同一版本最多成功一次）、读取快照一致性、404/400/422 分支，
+以及用“可暂停并释放”的求解器做真实 HTTP 并发：验证耗时计算期间健康检查、
+已存在作业读取与其他合法切换不被阻塞，后来的同作业切换可先算完并提交、
+先到者提交时返回 409 且不覆盖新状态，以及失败（422）后同版本重试。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -446,3 +450,309 @@ def test_read_snapshot_never_mixes_versions():
     assert final["closed_pipes"] == ["P2"]
     assert final["unserved_nodes"] == ["B"]
     assert final["unserved_demand"] == pytest.approx(3.0)
+
+
+# --------------------------------------------------------------------------- #
+# 真实 HTTP 并发：可暂停并释放的求解器（不依赖大管网或长时间等待）
+# --------------------------------------------------------------------------- #
+class _PauseGate:
+    """测试用“闸门”：按求解子网管段集合作为键拦截 solve_network 调用。
+
+    arm(key) 后，对该子网络的求解会阻塞在闸门处（记录到达、计数 +1），
+    直到 release(key) 放行（可指定放行时抛出不收敛）；到达后可用 wait_arrived
+    同步。拦截为一次性的（释放时摘除键值），故重试不会再次被同一键拦住。
+    不放大管网、不做固定睡眠：未被 arm 的键直接正常求解。
+    """
+
+    def __init__(self) -> None:
+        self._armed: dict[str, dict[str, object]] = {}
+        self._cv = threading.Condition()
+        self.hits: dict[str, int] = {}
+        self.total_calls = 0
+
+    def arm(self, key: str, *, fail: bool = False) -> None:
+        with self._cv:
+            self._armed[key] = {"released": False, "fail": fail, "arrived": 0}
+            self.hits[key] = 0
+
+    def _pipe_key(self, net) -> str:
+        return ",".join(p["id"] for p in net.pipes)
+
+    def __call__(self, net):
+        self.total_calls += 1
+        key = self._pipe_key(net)
+        with self._cv:
+            slot = self._armed.get(key)
+            if slot is None:
+                return self._real(net)
+            slot["arrived"] = int(slot["arrived"]) + 1
+            self.hits[key] = self.hits.get(key, 0) + 1
+            self._cv.notify_all()
+            while not slot["released"]:
+                self._cv.wait()
+            fail = bool(slot["fail"])
+            # 一次性拦截：释放后摘除，后续相同子网络（如重试）直接正常求解
+            self._armed.pop(key, None)
+        if fail:
+            raise SolverNotConverged("闸门注入：本次求解不收敛")
+        return self._real(net)
+
+    def wait_arrived(self, key: str, *, count: int = 1, timeout: float = 5.0) -> None:
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while int(self._armed.get(key, {}).get("arrived", 0)) < count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._cv.wait(remaining):
+                    raise AssertionError(f"等待求解到达闸门 {key!r} 超时")
+
+    def release(self, key: str) -> None:
+        with self._cv:
+            slot = self._armed.get(key)
+            if slot is not None:
+                slot["released"] = True
+            self._cv.notify_all()
+
+    def install(self, monkeypatch) -> None:
+        self._real = iso.solve_network
+        monkeypatch.setattr(iso, "solve_network", self)
+
+
+class _Background:
+    """在后台线程发起 TestClient 请求并保留结果（每个线程使用独立 client）。"""
+
+    def __init__(self, method: str, path: str, **kwargs) -> None:
+        def run():
+            local = TestClient(app)
+            try:
+                self.response = getattr(local, method)(path, **kwargs)
+            except Exception as exc:  # noqa: BLE001 - 主线程断言时统一报告
+                self.error = exc
+
+        self.error: Exception | None = None
+        self.response = None
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+
+    def join(self, timeout: float = 10.0):
+        self.thread.join(timeout)
+        assert not self.thread.is_alive(), "后台 HTTP 请求超时未返回"
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def _chain_payload(*, source_head=50.0):
+    """链状网 S─QX→X─QY→Y：QX 关闭则 X、Y 都失供（源端平凡解，无需求解）。"""
+    return {
+        "nodes": [
+            {"id": "S", "type": "source", "head": source_head},
+            {"id": "X", "type": "demand", "demand": 2.0},
+            {"id": "Y", "type": "demand", "demand": 3.0},
+        ],
+        "pipes": [
+            {"id": "QX", "start": "S", "end": "X", "r": 1.0},
+            {"id": "QY", "start": "X", "end": "Y", "r": 1.0},
+        ],
+        "min_head": 0.0,
+        "allow_unserved": ["X", "Y"],
+    }
+
+
+def test_http_concurrency_during_create_and_toggle(monkeypatch):
+    """创建（慢求解）进行期间：健康检查、已有作业读取、其他作业的合法切换立即返回。"""
+    gate = _PauseGate()
+    gate.install(monkeypatch)
+    # 创建新作业时子网络为全部开启管段，键即两根管
+    gate.arm("QX,QY")
+
+    pending_create = _Background(
+        "post", "/api/isolation-jobs", json=_chain_payload())
+    gate.wait_arrived("QX,QY")
+
+    # 1) 健康检查不被耗时计算阻塞
+    t0 = time.monotonic()
+    resp = TestClient(app).get("/api/health")
+    assert resp.status_code == 200 and resp.json() == {"status": "ok"}
+    assert time.monotonic() - t0 < 2.0
+
+    # 2) 已存在作业的读取立即返回最近已提交的完整快照（版本 0），不等待计算
+    existing = _create(_tree_payload())
+    t0 = time.monotonic()
+    got = _get(existing["job_id"])
+    assert time.monotonic() - t0 < 2.0
+    assert got == existing and got["version"] == 0
+
+    # 3) 另一个作业的合法切换（关桥 P2 → B 失供但允许）：连通区剩 S、A，
+    #    子网管段集合 "P1"，键不同，立即算完提交，不等闸门
+    other = _create({**_tree_payload(), "allow_unserved": ["B"]})
+    t0 = time.monotonic()
+    resp = _toggle(other["job_id"], 0, "P2")
+    assert resp.status_code == 200
+    assert time.monotonic() - t0 < 2.0
+    assert resp.json()["job"]["version"] == 1
+    assert resp.json()["job"]["closed_pipes"] == ["P2"]
+    # 慢创建尚未提交：作业注册表中仍读不到它（读到的是创建前的世界）
+    # 而 other 作业的读取展示的就是刚刚提交的版本 1
+    assert _get(other["job_id"])["version"] == 1
+
+    # 4) 放行创建：返回版本 0 快照
+    gate.release("QX,QY")
+    created = pending_create.join().json()["job"]
+    assert created["version"] == 0
+    assert _get(created["job_id"])["closed_pipes"] == []
+
+
+def test_http_same_job_later_toggle_may_commit_first(monkeypatch):
+    """同一作业：后发的切换先算完并提交；先来者提交时版本已变 → 409，不覆盖。
+
+    旧实现里先来的切换会在整个求解期间占住作业锁，后发切换必然排队等待；
+    新实现求解在锁外进行，后发的关 QX（仅余水源、平凡解）立即提交 0→1，
+    先来者放行后在提交阶段复核版本，得到 409 与 current_version，其结果
+    （关闭集合 {QY}）被丢弃，绝不覆盖已提交的 {QX}。
+    """
+    gate = _PauseGate()
+    gate.install(monkeypatch)
+    job = _create(_chain_payload())
+    jid = job["job_id"]
+
+    gate.arm("QX")  # 先来者：v0 关 QY → 连通区 S,X 需解 "QX"，被闸门拦住
+    slow_a = _Background(
+        "post", f"/api/isolation-jobs/{jid}/toggle",
+        json={"version": 0, "pipe_id": "QY"})
+    gate.wait_arrived("QX")
+
+    # 计算期间：读取只展示最近已提交的完整快照（仍为版本 0），健康检查正常
+    assert _get(jid)["version"] == 0
+    assert _get(jid)["closed_pipes"] == []
+    assert TestClient(app).get("/api/health").status_code == 200
+
+    # 后来的切换（同版本 0、关 QX）：连通区仅余水源，平凡解不调求解器，
+    # 不被闸门阻塞，立即算完并先提交：版本 0 → 1
+    t0 = time.monotonic()
+    resp_b = _toggle(jid, 0, "QX")
+    assert resp_b.status_code == 200
+    assert time.monotonic() - t0 < 2.0
+    snap_b = resp_b.json()["job"]
+    assert snap_b["version"] == 1 and snap_b["closed_pipes"] == ["QX"]
+    assert snap_b["source_only"] is True
+    # A 仍在计算：读取已能看到 B 提交的完整版本 1 快照
+    assert _get(jid)["version"] == 1
+    assert _get(jid)["closed_pipes"] == ["QX"]
+
+    # 放行先来者 A：提交时版本已被推进到 1，返回 409 + current_version=1，
+    # A 的结果（关闭集合 {QY}、快照版本 1）被丢弃，不覆盖 B 的新状态
+    gate.release("QX")
+    resp_a = slow_a.join()
+    assert resp_a.status_code == 409
+    body_a = resp_a.json()
+    assert body_a["ok"] is False and body_a["current_version"] == 1
+    assert "版本冲突" in body_a["error"]
+
+    final = _get(jid)
+    assert final["version"] == 1
+    assert final["closed_pipes"] == ["QX"]
+    assert final["unserved_nodes"] == ["X", "Y"]
+
+    # 客户端按 current_version 重读后携带新版本重试：v1 再关 QY（仍仅余
+    # 水源，平凡解）成功，版本 1 → 2，且同版本再来一次立即 409
+    resp = _toggle(jid, 1, "QY")
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 2
+    assert resp.json()["job"]["closed_pipes"] == ["QX", "QY"]
+    dup = _toggle(jid, 1, "QY")
+    assert dup.status_code == 409 and dup.json()["current_version"] == 2
+
+
+def test_http_failed_toggle_unblocks_and_retry_same_version(monkeypatch):
+    """慢切换在闸门处失败（422，不推进版本）后：同版本合法重试成功。"""
+    gate = _PauseGate()
+    gate.install(monkeypatch)
+    job = _create(_chain_payload())
+    jid = job["job_id"]
+
+    # v0 关 QY：连通区 S,X 需解 "QX"；放行时让其“不收敛”→ 422
+    gate.arm("QX", fail=True)
+    slow = _Background(
+        "post", f"/api/isolation-jobs/{jid}/toggle",
+        json={"version": 0, "pipe_id": "QY"})
+    gate.wait_arrived("QX")
+
+    # 计算失败期间其他操作照常：健康检查、读取（仍版本 0）
+    assert TestClient(app).get("/api/health").status_code == 200
+    assert _get(jid)["version"] == 0
+
+    gate.release("QX")
+    resp = slow.join()
+    assert resp.status_code == 422
+    assert "未能收敛" in resp.json()["error"] and "保持原状" in resp.json()["error"]
+
+    # 失败不推进版本：仍是版本 0、无关闭管段
+    got = _get(jid)
+    assert got["version"] == 0 and got["closed_pipes"] == []
+
+    # 同版本改发另一个合法操作（关 QX：仅余水源，平凡解不调求解器）成功
+    resp = _toggle(jid, 0, "QX")
+    assert resp.status_code == 200
+    snap = resp.json()["job"]
+    assert snap["version"] == 1
+    assert snap["closed_pipes"] == ["QX"]
+    assert snap["source_only"] is True and snap["unserved_nodes"] == ["X", "Y"]
+
+
+def test_http_transient_failure_then_retry_recomputes(monkeypatch):
+    """慢切换第一次放行时不收敛（422），拦截为一次性：同版本重试正常求解并成功。"""
+    gate = _PauseGate()
+    gate.install(monkeypatch)
+    p = _chain_payload()
+    job = _create(p)
+    jid = job["job_id"]
+
+    gate.arm("QX", fail=True)
+    slow = _Background(
+        "post", f"/api/isolation-jobs/{jid}/toggle",
+        json={"version": 0, "pipe_id": "QY"})
+    gate.wait_arrived("QX")
+    gate.release("QX")
+    assert slow.join().status_code == 422
+    total_before = gate.total_calls
+    assert gate.hits["QX"] == 1
+
+    # 闸门键已摘除：同版本同管段重试走真实求解（S、X 连通区），成功提交
+    t0 = time.monotonic()
+    resp = _toggle(jid, 0, "QY")
+    assert resp.status_code == 200
+    assert time.monotonic() - t0 < 2.0
+    snap = resp.json()["job"]
+    assert snap["version"] == 1 and snap["closed_pipes"] == ["QY"]
+    assert snap["component_nodes"] == ["S", "X"]
+    assert snap["unserved_nodes"] == ["Y"]
+    # 重试重新触发了一次求解（没有被旧闸门吞掉，也没复用失败结果）
+    assert gate.total_calls == total_before + 1
+    assert gate.hits["QX"] == 1  # 第二次为未拦截的直通
+
+
+def test_http_concurrent_fail_then_other_version_commits(monkeypatch):
+    """慢切换失败计算进行中，另一同版本合法切换已提交：失败结果不得覆盖新状态。"""
+    gate = _PauseGate()
+    gate.install(monkeypatch)
+    job = _create(_chain_payload())
+    jid = job["job_id"]
+
+    gate.arm("QX", fail=True)  # 慢：v0 关 QY，放行时不收敛
+    slow = _Background(
+        "post", f"/api/isolation-jobs/{jid}/toggle",
+        json={"version": 0, "pipe_id": "QY"})
+    gate.wait_arrived("QX")
+
+    # 同版本另一合法切换（关 QX：仅余水源，平凡解）立即成功：0 → 1
+    resp = _toggle(jid, 0, "QX")
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 1
+    assert _get(jid)["closed_pipes"] == ["QX"]
+
+    # 放行失败的慢切换：规则失败返回 422，绝不能覆盖已提交的版本 1
+    gate.release("QX")
+    resp = slow.join()
+    assert resp.status_code == 422
+    got = _get(jid)
+    assert got["version"] == 1 and got["closed_pipes"] == ["QX"]

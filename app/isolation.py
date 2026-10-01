@@ -16,6 +16,12 @@
 非法操作、不收敛或规则不满足时全部保持原状并说明原因。版本号即乐观锁：
 同一版本的并发切换最多成功一次；读取始终返回某一版本的完整快照，绝不混合
 不同版本的数据。
+
+耗时的稳态求解在作业锁之外进行（由路由层放入线程池），因此计算期间健康检查、
+已存在作业的快照读取以及其他作业（或同作业其他版本）的合法切换都不必等待。
+求解结束后在短锁内做一次版本复核（compare-and-set）：版本已被后来的切换推进
+时放弃提交并抛 VersionConflictError（409 + current_version），绝不覆盖新状态；
+后来的切换允许比先来的切换更早算完并提交。
 """
 
 from __future__ import annotations
@@ -268,11 +274,22 @@ def create_job(payload: Any) -> dict[str, Any]:
     return snapshot
 
 
-def get_snapshot(job_id: str) -> dict[str, Any]:
-    """读取作业当前版本的完整快照（快照为不可变整体，绝不混合不同版本的数据）。"""
+def _lookup_job(job_id: str) -> _IsolationJob:
+    """在注册表锁内取出作业（注册/注销与查询互斥）；不存在抛 JobNotFoundError。"""
     job = _JOBS.get(job_id)
     if job is None:
         raise JobNotFoundError(job_id)
+    return job
+
+
+def get_snapshot(job_id: str) -> dict[str, Any]:
+    """读取作业最近一次成功提交的完整快照（不可变整体，绝不混合不同版本）。
+
+    即使本作业正有切换在求解，也只需获取一次短锁即可返回——读取展示的永远是
+    最近已提交的完整快照，不等待、也不展示尚未提交的中间状态。
+    """
+    with _REGISTRY_LOCK:
+        job = _lookup_job(job_id)
     with job.lock:
         return job.snapshot
 
@@ -283,10 +300,13 @@ def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
     版本不一致抛 VersionConflictError（同一版本的并发切换最多成功一次）；
     管段不存在、规则不满足或求解不收敛时抛异常，关闭集合、版本号与稳态
     结果全部保持原状。
+
+    分两阶段加锁，确保耗时求解不占住任何作业锁：
+      1. 短锁内读出当前版本与关闭集合、校验管段存在，随即释放锁开始求解；
+      2. 求解结束后再取短锁做版本复核：版本未被推进才提交，否则视为后来的
+         切换已经先算完并提交，本次返回 409（携带 current_version），
+         绝不覆盖新状态。因此后发的切换可以先完成提交。
     """
-    job = _JOBS.get(job_id)
-    if job is None:
-        raise JobNotFoundError(job_id)
     if not isinstance(payload, dict):
         raise ValidationError("请求体必须是包含 version 与 pipe_id 的对象。")
     version = payload.get("version")
@@ -297,17 +317,32 @@ def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
         raise ValidationError("pipe_id 必须是要切换开闭的现有管段编号（非空字符串）。")
     pipe_id = pipe_id.strip()
 
+    with _REGISTRY_LOCK:
+        job = _lookup_job(job_id)
+
+    # ---- 阶段 1：短锁内取基线状态（版本、关闭集合、管段校验）后立即释放 ----
     with job.lock:
-        if version != job.version:
+        base_version = job.version
+        base_closed = job.closed_pipes
+        pipe_exists = pipe_id in {p["id"] for p in job.network.pipes}
+    if version != base_version:
+        raise VersionConflictError(version, base_version)
+    if not pipe_exists:
+        raise ValidationError(
+            f"管段“{pipe_id}”不是该作业管网中已定义的管段。")
+
+    new_closed = base_closed ^ {pipe_id}  # 开→关 或 关→开
+
+    # ---- 锁外计算：耗时的连通区求解不阻塞读取与其他作业的切换 -------------
+    snapshot = _build_snapshot(job.job_id, base_version + 1, job.network,
+                               job.allowed_unserved, new_closed, create=False)
+
+    # ---- 阶段 2：短锁内版本复核后一次性提交（compare-and-set） -------------
+    with job.lock:
+        if job.version != base_version:
+            # 后来的切换已经先算完并提交：同版本最多一次成功，不得覆盖新状态
             raise VersionConflictError(version, job.version)
-        if pipe_id not in {p["id"] for p in job.network.pipes}:
-            raise ValidationError(
-                f"管段“{pipe_id}”不是该作业管网中已定义的管段。")
-        new_closed = job.closed_pipes ^ {pipe_id}  # 开→关 或 关→开
-        snapshot = _build_snapshot(job.job_id, job.version + 1, job.network,
-                                   job.allowed_unserved, new_closed, create=False)
-        # 全部规则满足且求解收敛：一次性提交关闭集合、版本号与稳态结果
         job.closed_pipes = new_closed
-        job.version += 1
+        job.version = base_version + 1
         job.snapshot = snapshot
         return snapshot
