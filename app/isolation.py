@@ -16,6 +16,16 @@
 非法操作、不收敛或规则不满足时全部保持原状并说明原因。版本号即乐观锁：
 同一版本的并发切换最多成功一次；读取始终返回某一版本的完整快照，绝不混合
 不同版本的数据。
+
+耗时的连通区重算与稳态求解在作业锁之外进行，因此计算期间健康检查、已提交
+快照的读取以及其他作业的操作都不会被阻塞；同一作业也允许后来的切换先算完
+并先提交。临界区只在提交瞬间持有：提交时重新比对版本，版本已被后来者推进
+则本次结果作废、返回 409 与当前版本，绝不覆盖新状态；规则校验或求解失败
+同样不推进版本。
+
+模块级 ``_COMPUTE_GATE`` 仅供测试使用：生产环境为 None；测试可把它替换成
+可调用对象，在每次重算开始（规则判定与求解器调用之前）同步阻塞该次计算，
+从而用“暂停/放行”而不是大管网或长时间等待来确定 HTTP 并发顺序。
 """
 
 from __future__ import annotations
@@ -23,6 +33,7 @@ from __future__ import annotations
 import threading
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,6 +81,11 @@ class _IsolationJob:
 # 作业注册表：仅存于单进程内存，服务重启即清空
 _JOBS: dict[str, _IsolationJob] = {}
 _REGISTRY_LOCK = threading.Lock()
+
+# 测试钩子：None（生产默认）表示直通；测试可替换为形如
+# gate(job_id, stage, *, version, closed) -> None 的可调用对象，
+# 在每次快照重算开始时同步调用并允许阻塞（作业锁在此时并不持有）。
+_COMPUTE_GATE: Callable[..., None] | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -166,6 +182,10 @@ def _build_snapshot(job_id: str, version: int, net: Network,
     create=True 用于创建时的初始状态（全部管段开启），失败文案为“不创建作业”；
     create=False 用于切换管段，失败文案为“本次操作未生效，作业保持原状”。
     """
+    if _COMPUTE_GATE is not None:
+        _COMPUTE_GATE(job_id, "create" if create else "toggle",
+                      version=version, closed=frozenset(closed))
+
     source_id = next(n["id"] for n in net.nodes if n["type"] == "source")
     demand_map = {n["id"]: n["demand"] for n in net.nodes if n["type"] == "demand"}
 
@@ -249,11 +269,13 @@ def create_job(payload: Any) -> dict[str, Any]:
     """创建停管隔离作业，返回版本 0 的初始快照。
 
     沿用同一套管网校验与稳态求解；校验失败、初始有用水节点欠压或初始求解
-    不收敛时抛异常，不创建作业。
+    不收敛时抛异常，不创建作业。初始重算不持有任何作业锁，阻塞期间不影响
+    其他作业的读取与切换。
     """
     net = validate_payload(payload)
     allowed = _validate_allow_unserved(payload.get("allow_unserved"), net)
     job_id = uuid.uuid4().hex
+    # 重算在注册表锁之外完成；通过前作业尚不存在，失败自然不会留下任何状态
     snapshot = _build_snapshot(job_id, 0, net, allowed, frozenset(), create=True)
     job = _IsolationJob(
         job_id=job_id,
@@ -269,8 +291,13 @@ def create_job(payload: Any) -> dict[str, Any]:
 
 
 def get_snapshot(job_id: str) -> dict[str, Any]:
-    """读取作业当前版本的完整快照（快照为不可变整体，绝不混合不同版本的数据）。"""
-    job = _JOBS.get(job_id)
+    """读取作业最近一次成功提交的完整快照（快照为不可变整体，绝不混合不同版本的数据）。
+
+    即使该作业此刻正在重算，本函数也只短暂加锁后立即返回最近已提交的快照，
+    不会等待进行中的计算。
+    """
+    with _REGISTRY_LOCK:
+        job = _JOBS.get(job_id)
     if job is None:
         raise JobNotFoundError(job_id)
     with job.lock:
@@ -283,8 +310,14 @@ def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
     版本不一致抛 VersionConflictError（同一版本的并发切换最多成功一次）；
     管段不存在、规则不满足或求解不收敛时抛异常，关闭集合、版本号与稳态
     结果全部保持原状。
+
+    耗时的快照重算在作业锁之外进行：同一作业的多个切换可以同时计算，
+    后来的切换甚至可以先算完先提交。临界区只在提交瞬间出现：提交时重新
+    比对版本，若在本次计算期间版本已被其他成功切换推进，则本次结果作废
+    并抛 VersionConflictError（携带作业当前版本），绝不覆盖新状态。
     """
-    job = _JOBS.get(job_id)
+    with _REGISTRY_LOCK:
+        job = _JOBS.get(job_id)
     if job is None:
         raise JobNotFoundError(job_id)
     if not isinstance(payload, dict):
@@ -297,17 +330,29 @@ def toggle_pipe(job_id: str, payload: Any) -> dict[str, Any]:
         raise ValidationError("pipe_id 必须是要切换开闭的现有管段编号（非空字符串）。")
     pipe_id = pipe_id.strip()
 
+    # 第 1 段临界区：仅做输入归属核对与基态快照，立即释放，不带着锁做重算
     with job.lock:
         if version != job.version:
             raise VersionConflictError(version, job.version)
         if pipe_id not in {p["id"] for p in job.network.pipes}:
             raise ValidationError(
                 f"管段“{pipe_id}”不是该作业管网中已定义的管段。")
-        new_closed = job.closed_pipes ^ {pipe_id}  # 开→关 或 关→开
-        snapshot = _build_snapshot(job.job_id, job.version + 1, job.network,
-                                   job.allowed_unserved, new_closed, create=False)
+        base_version = job.version
+        base_closed = job.closed_pipes
+        net = job.network
+        allowed = job.allowed_unserved
+
+    new_closed = base_closed ^ {pipe_id}  # 开→关 或 关→开
+    # 锁外重算：其他请求（健康检查、读取、其他作业、后来的切换）在此期间照常返回
+    candidate = _build_snapshot(job.job_id, base_version + 1, net,
+                                allowed, new_closed, create=False)
+
+    # 第 2 段临界区：提交时重新比对版本——计算期间版本若已推进则丢弃本次结果
+    with job.lock:
+        if job.version != base_version:
+            raise VersionConflictError(version, job.version)
         # 全部规则满足且求解收敛：一次性提交关闭集合、版本号与稳态结果
         job.closed_pipes = new_closed
-        job.version += 1
-        job.snapshot = snapshot
-        return snapshot
+        job.version = base_version + 1
+        job.snapshot = candidate
+        return candidate

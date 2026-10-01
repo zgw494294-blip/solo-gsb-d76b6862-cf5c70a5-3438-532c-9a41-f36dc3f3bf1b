@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from .isolation import (
     IsolationRuleError,
@@ -170,12 +171,16 @@ def _isolation_error(exc: Exception) -> JSONResponse:
 
 @app.post("/api/isolation-jobs")
 async def create_isolation_job(request: Request) -> JSONResponse:
-    """创建停管隔离作业：沿用校验与稳态求解，初始欠压或不收敛则不创建。"""
+    """创建停管隔离作业：沿用校验与稳态求解，初始欠压或不收敛则不创建。
+
+    校验与初始求解放到工作线程执行：单进程单事件循环下，计算期间健康检查、
+    已有作业读取和其他作业的切换仍可立即返回。
+    """
     payload, bad = await _load_payload(request)
     if bad is not None:
         return bad
     try:
-        snapshot = create_job(payload)
+        snapshot = await run_in_threadpool(create_job, payload)
     except _ISOLATION_ERRORS as exc:
         return _isolation_error(exc)
     return JSONResponse(content={"ok": True, "job": snapshot})
@@ -183,7 +188,7 @@ async def create_isolation_job(request: Request) -> JSONResponse:
 
 @app.get("/api/isolation-jobs/{job_id}")
 async def read_isolation_job(job_id: str) -> JSONResponse:
-    """读取作业当前版本的完整快照；快照整体来自同一版本，绝不混合不同版本的数据。"""
+    """读取最近一次成功提交的完整快照；即使作业正在计算也立即返回，绝不混合版本。"""
     try:
         snapshot = get_snapshot(job_id)
     except JobNotFoundError as exc:
@@ -193,13 +198,17 @@ async def read_isolation_job(job_id: str) -> JSONResponse:
 
 @app.post("/api/isolation-jobs/{job_id}/toggle")
 async def toggle_isolation_pipe(job_id: str, request: Request) -> JSONResponse:
-    """携带当前版本切换一根现有管段的开闭；成功才提交新版本，失败全部保持原状。"""
+    """携带当前版本切换一根现有管段的开闭；成功才提交新版本，失败全部保持原状。
+
+    重算在工作线程进行，不阻塞事件循环：计算期间该作业的读取返回最近已提交
+    快照，其他作业与健康检查照常服务。
+    """
     payload, bad = await _load_payload(
         request, empty_hint="请求体为空，请提供 version（作业当前版本号）与 pipe_id。")
     if bad is not None:
         return bad
     try:
-        snapshot = toggle_pipe(job_id, payload)
+        snapshot = await run_in_threadpool(toggle_pipe, job_id, payload)
     except _ISOLATION_ERRORS as exc:
         return _isolation_error(exc)
     pipe_id = payload["pipe_id"].strip()

@@ -2,12 +2,15 @@
 
 覆盖：创建（含初始欠压/不收敛不创建）、allow_unserved 校验、切换管段的
 失供/欠压/不收敛规则、仅剩水源供水量为零、重连恢复原需水量、版本冲突
-（含多线程并发同一版本最多成功一次）、读取快照一致性、404/400/422 分支。
+（含多线程并发同一版本最多成功一次）、读取快照一致性、404/400/422 分支，
+以及计算期间的 HTTP 并发顺序（可暂停求解门：健康检查/读取/其他作业不阻塞、
+后来的切换先提交、迟到者 409、失败后同版本重试）。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -446,3 +449,314 @@ def test_read_snapshot_never_mixes_versions():
     assert final["closed_pipes"] == ["P2"]
     assert final["unserved_nodes"] == ["B"]
     assert final["unserved_demand"] == pytest.approx(3.0)
+
+
+# ------------------ 计算期间的 HTTP 并发（可暂停求解门） ------------------ #
+class _PausableCompute:
+    """测试用“求解门”：命中条件的那次重算在真正求解前被暂停，可显式放行。
+
+    不靠大管网或 sleep 制造耗时：替换 iso._COMPUTE_GATE 后，目标切换的重算
+    线程会阻塞在 gate 内（此时不持有任何作业锁），测试线程可借这个确定的
+    暂停点核对并发顺序，再 release() 放行让其继续提交。仅首个命中的调用被
+    暂停（原子认领，其余调用直接放行），天然适配“失败后用同版本重试”。
+    """
+
+    def __init__(self, *, job_id, stage, closed=frozenset(), hold_seconds=5.0):
+        self._want_job = job_id  # None 表示不挑作业（用于创建时 ID 尚未生成）
+        self._want_stage = stage
+        self._want_closed = frozenset(closed)
+        self._hold = hold_seconds
+        self._claimed = threading.Lock()
+        self.arrived = threading.Event()  # 命中的重算已到达并被暂停
+        self.released = threading.Event()  # 放行开关
+
+    def __call__(self, gate_job_id, stage, *, version, closed):
+        hit = ((self._want_job is None or gate_job_id == self._want_job)
+               and stage == self._want_stage
+               and frozenset(closed) == self._want_closed)
+        if not hit:
+            return
+        if not self._claimed.acquire(blocking=False):
+            return  # 仅首个命中者被暂停；之后（如重试）的调用直接通过
+        self.arrived.set()
+        if not self.released.wait(timeout=self._hold):
+            raise AssertionError("求解门在超时内未被放行，测试疑似死锁")
+
+
+
+# --------------------------------------------------------------------------- #
+# 计算期间的 HTTP 并发：对真实 Uvicorn 进程（守护线程内、随机端口）发请求
+# --------------------------------------------------------------------------- #
+import socket  # noqa: E402
+
+import httpx  # noqa: E402
+import uvicorn  # noqa: E402
+
+
+@pytest.fixture(scope="module")
+def server():
+    """在守护线程内启动单进程 Uvicorn（与 Compose 同一启动方式的进程模型）。
+
+    所有并发断言都打在这个真实服务器上，而非每请求独立门户的 TestClient，
+    才能证明求解期间唯一的事件循环仍可处理健康检查与读取。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+
+    config = uvicorn.Config(app, host="127.0.0.1", port=port,
+                            log_level="warning", lifespan="off")
+    server_inst = uvicorn.Server(config)
+    thread = threading.Thread(target=server_inst.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                break
+        except OSError:
+            time.sleep(0.02)
+    else:
+        raise RuntimeError("测试用 Uvicorn 未能在超时内就绪")
+    with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10) as http:
+        yield http
+    server_inst.should_exit = True
+    thread.join(timeout=5)
+
+
+def _create_on(http, payload) -> dict:
+    resp = http.post("/api/isolation-jobs", json=payload)
+    assert resp.status_code == 200, resp.text
+    return resp.json()["job"]
+
+
+def _toggle_on(http, job_id, version, pipe_id):
+    return http.post(f"/api/isolation-jobs/{job_id}/toggle",
+                     json={"version": version, "pipe_id": pipe_id})
+
+
+def _post_async_on(http, path, body):
+    """守护线程内发起真实 HTTP 请求，返回 (线程, result 容器)。"""
+    result: dict[str, object] = {}
+
+    def worker():
+        try:
+            result["response"] = http.post(path, json=body)
+        except Exception as exc:  # noqa: BLE001 - 让 join 方看到异常
+            result["error"] = exc
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    return t, result
+
+
+def test_http_concurrency_during_toggle_later_toggle_commits_first(server, monkeypatch):
+    """同一版本两个切换并发：后来的切换先算完先提交，先发起的迟到提交收 409。
+
+    暂停点内同时核对：健康检查立即 200（唯一事件循环未被占住）、读取只给
+    最近已提交快照（v0）、其他作业的合法切换立即完成；迟到者收到 409 与
+    current_version，按最新版本重试后成功，最终状态不被覆盖。
+    """
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    other = _create_on(server, _loop_payload())  # 预先存在的另一作业
+
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    # A：v0 关 P1（连通区仅剩水源，合法）——重算被暂停
+    t_a, res_a = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P1"})
+    assert gate.arrived.wait(timeout=5)
+
+    # 暂停期间：健康检查立即返回（证明单一事件循环未被求解占住）
+    assert server.get("/api/health").status_code == 200
+    # 读取只展示最近已提交的完整快照：仍是 v0，不泄露 A 的候选结果
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
+    # 其他作业的合法切换照常算完并提交
+    other_resp = _toggle_on(server, other["job_id"], 0, "P3")
+    assert other_resp.status_code == 200
+    assert other_resp.json()["job"]["version"] == 1
+    assert other_resp.json()["job"]["unserved_nodes"] == []
+    # 暂停期间重复读取，永远拿到 v0 整体快照（绝不含半成品）
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 0
+
+    # B：同一作业、同一 v0，关 P2（B 失供但允许，合法）——不命中暂停门，
+    # 在 A 仍被暂停时先算完并先提交：v0 -> v1
+    resp_b = _toggle_on(server, jid, 0, "P2")
+    assert resp_b.status_code == 200
+    job1 = resp_b.json()["job"]
+    assert job1["version"] == 1
+    assert job1["closed_pipes"] == ["P2"]
+    assert job1["unserved_nodes"] == ["B"]
+
+    # 放行 A：其候选基于已过期的 v0 算成，提交时版本已变 -> 409，
+    # current_version 为 1，且绝不覆盖 B 刚提交的状态
+    gate.released.set()
+    t_a.join(timeout=5)
+    assert not t_a.is_alive()
+    assert "error" not in res_a, res_a.get("error")
+    resp_a = res_a["response"]
+    assert resp_a.status_code == 409
+    assert resp_a.json()["current_version"] == 1
+    assert "版本冲突" in resp_a.json()["error"]
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 1 and got["closed_pipes"] == ["P2"]
+
+    # 按 409 携带的 current_version 重试 A 的意图（在 v1 上再关 P1）：
+    # A、B 同时失供但均在允许集合内，成功提交 v2
+    resp_retry = _toggle_on(server, jid, 1, "P1")
+    assert resp_retry.status_code == 200
+    job2 = resp_retry.json()["job"]
+    assert job2["version"] == 2
+    assert job2["closed_pipes"] == ["P1", "P2"]
+    assert job2["unserved_nodes"] == ["A", "B"]
+    assert job2["source_only"] is True
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"] == job2
+
+
+def test_http_concurrency_failing_toggle_unserved_keeps_state_then_retry(
+        server, monkeypatch):
+    """被暂停的切换最终因失供规则失败：耗时期间服务可交互，失败不推进版本。
+
+    放行返回 422 后，用同一版本 0 改发另一合法切换仍然成功。
+    """
+    p = _tree_payload()
+    p["allow_unserved"] = ["B"]  # 关 P1 会让 A 失供（不允许）；关 P2 合法
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_fail, res_fail = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P1"})
+    assert gate.arrived.wait(timeout=5)
+
+    # 慢失败计算期间：健康检查与读取都立即返回，快照仍为 v0
+    assert server.get("/api/health").status_code == 200
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 0
+
+    gate.released.set()
+    t_fail.join(timeout=5)
+    resp_fail = res_fail["response"]
+    assert resp_fail.status_code == 422
+    err = resp_fail.json()["error"]
+    assert "“A”" in err and "失供" in err and "保持原状" in err
+    # 失败不推进版本、不改变关闭集合与稳态结果
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
+    assert got["source_supply"] == pytest.approx(5.0)
+
+    # 同一版本 0 改发合法切换（关 P2，B 在允许集合内）仍可成功
+    resp = _toggle_on(server, jid, 0, "P2")
+    assert resp.status_code == 200
+    job1 = resp.json()["job"]
+    assert job1["version"] == 1 and job1["closed_pipes"] == ["P2"]
+    assert job1["unserved_nodes"] == ["B"]
+
+
+def test_http_concurrency_failing_toggle_under_pressure_keeps_version(
+        server, monkeypatch):
+    """被暂停的切换最终因欠压失败：失败后同一版本的合法切换照常成功。"""
+    job = _create_on(server, _loop_payload())
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P1"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_bad, res_bad = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P1"})  # 关 P1 后 B 欠压
+    assert gate.arrived.wait(timeout=5)
+    assert server.get("/api/health").status_code == 200  # 计算期间仍可交互
+
+    gate.released.set()
+    t_bad.join(timeout=5)
+    resp_bad = res_bad["response"]
+    assert resp_bad.status_code == 422
+    assert "低于最低水头限值" in resp_bad.json()["error"]
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 0
+    # 欠压失败也不消耗版本：仍用版本 0 关 P3（合法）成功
+    resp = _toggle_on(server, jid, 0, "P3")
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 1
+    assert resp.json()["job"]["closed_pipes"] == ["P3"]
+
+
+def test_http_concurrency_during_create_other_requests_still_served(
+        server, monkeypatch):
+    """创建作业本身在求解时，健康检查、已有作业读取和其他作业切换也能返回。"""
+    existing = _create_on(server, _loop_payload())
+    # 创建作业的 job_id 随机生成：job_id=None 表示不挑作业，只匹配创建重算
+    gate = _PausableCompute(job_id=None, stage="create")
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_new, res_new = _post_async_on(server, "/api/isolation-jobs", _tree_payload())
+    assert gate.arrived.wait(timeout=5)
+
+    # 创建的初始求解期间：健康检查、已存在作业读取均立即返回
+    assert server.get("/api/health").status_code == 200
+    got = server.get(f"/api/isolation-jobs/{existing['job_id']}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
+    # 其他作业的合法切换也能在创建结束前算完提交
+    resp = _toggle_on(server, existing["job_id"], 0, "P3")
+    assert resp.status_code == 200
+    assert resp.json()["job"]["version"] == 1
+
+    # 放行创建：返回版本 0 快照；作业 ID 与已有作业不同
+    gate.released.set()
+    t_new.join(timeout=5)
+    created = res_new["response"]
+    assert created.status_code == 200, created.text
+    new_job = created.json()["job"]
+    assert new_job["version"] == 0
+    assert new_job["job_id"] != existing["job_id"]
+    assert new_job["source_supply"] == pytest.approx(5.0)
+    # 放行期间被切换的已有作业状态不受创建影响
+    final = server.get(
+        f"/api/isolation-jobs/{existing['job_id']}").json()["job"]
+    assert final["version"] == 1 and final["closed_pipes"] == ["P3"]
+    # 创建放行后读到的仍是它自己版本 0 的完整快照
+    assert server.get(
+        f"/api/isolation-jobs/{new_job['job_id']}").json()["job"] == new_job
+
+
+def test_http_concurrent_same_version_two_legal_toggles_one_wins(
+        server, monkeypatch):
+    """两个同版本合法切换同时计算：先算完者提交成功，后到提交点的收 409。
+
+    先发起者先完成计算但提交被门挡住，另一切换走完计算并先提交 v1；
+    随后放行先发起者，验证无论到达提交点先后，同一版本最多一次成功提交，
+    且 409 带当前版本、不覆盖新状态。
+    """
+    p = _tree_payload()
+    p["allow_unserved"] = ["A", "B"]
+    job = _create_on(server, p)
+    jid = job["job_id"]
+    gate = _PausableCompute(job_id=jid, stage="toggle", closed=frozenset({"P2"}))
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_p2, res_p2 = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/toggle",
+        {"version": 0, "pipe_id": "P2"})
+    assert gate.arrived.wait(timeout=5)
+
+    # P2 已算好（提交被暂停）时，P1 从计算到提交一次走完 -> v1
+    resp_p1 = _toggle_on(server, jid, 0, "P1")
+    assert resp_p1.status_code == 200
+    assert resp_p1.json()["job"]["version"] == 1
+    assert resp_p1.json()["job"]["closed_pipes"] == ["P1"]
+
+    # 放行先发起的 P2：候选基于 v0，提交时版本已是 1 -> 409，不覆盖
+    gate.released.set()
+    t_p2.join(timeout=5)
+    resp_p2 = res_p2["response"]
+    assert resp_p2.status_code == 409
+    assert resp_p2.json()["current_version"] == 1
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 1 and got["closed_pipes"] == ["P1"]
